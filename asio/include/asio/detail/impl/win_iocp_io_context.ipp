@@ -371,9 +371,8 @@ void win_iocp_io_context::on_completion(win_iocp_operation* op,
   op->ready_ = 1;
 
   // Store results in the OVERLAPPED structure.
-  op->Internal = reinterpret_cast<ulong_ptr_t>(
-      &asio::error::get_system_category());
-  op->Offset = last_error;
+  op->Internal = static_cast<ULONG_PTR>(last_error);
+  op->Offset = reinterpret_cast<DWORD>(&asio::error::get_system_category());
   op->OffsetHigh = bytes_transferred;
 
   // Enqueue the operation on the I/O completion port.
@@ -394,8 +393,8 @@ void win_iocp_io_context::on_completion(win_iocp_operation* op,
   op->ready_ = 1;
 
   // Store results in the OVERLAPPED structure.
-  op->Internal = reinterpret_cast<ulong_ptr_t>(&ec.category());
-  op->Offset = ec.value();
+  op->Internal = static_cast<ULONG_PTR>(ec.value());
+  op->Offset = reinterpret_cast<DWORD>(&ec.category());
   op->OffsetHigh = bytes_transferred;
 
   // Enqueue the operation on the I/O completion port.
@@ -410,8 +409,136 @@ void win_iocp_io_context::on_completion(win_iocp_operation* op,
 }
 
 size_t win_iocp_io_context::do_one(DWORD msec,
-    win_iocp_thread_info& this_thread, asio::error_code& ec)
+  win_iocp_thread_info& this_thread, asio::error_code& ec)
 {
+#ifdef ASIO_HAS_WIN_IOCP_EX
+  for (;;)
+  {
+    // Try to acquire responsibility for dispatching timers and completed ops.
+    if (::InterlockedCompareExchange(&dispatch_required_, 0, 1) == 1)
+    {
+      mutex::scoped_lock lock(dispatch_mutex_);
+
+      // Dispatch pending timers and operations.
+      op_queue<win_iocp_operation> ops;
+      ops.push(completed_ops_);
+      timer_queues_.get_ready_timers(ops);
+      post_deferred_completions(ops);
+      update_timeout();
+    }
+
+#if !defined(ASIO_WIN_IOCP_EX_ENTRIES)
+#define ASIO_WIN_IOCP_EX_ENTRIES (64)
+#endif
+
+    // Get the next operations from the queue.
+    ULONG overlapped_num = 0;
+    OVERLAPPED_ENTRY overlapped_entries[ASIO_WIN_IOCP_EX_ENTRIES];
+    ::SetLastError(0);
+    BOOL ok = ::GetQueuedCompletionStatusEx(
+      iocp_.handle,
+      overlapped_entries,
+      (sizeof(overlapped_entries) / sizeof(overlapped_entries[0])),
+      &overlapped_num,
+      msec < gqcs_timeout_ ? msec : gqcs_timeout_,
+      FALSE
+    );
+    DWORD last_error = ::GetLastError();
+
+    if (!ok)
+    {
+      if (last_error != WAIT_TIMEOUT)
+      {
+        ec = asio::error_code(last_error,
+          asio::error::get_system_category());
+        return 0;
+      }
+
+      // If we're waiting indefinitely we need to keep going until we get a
+      // real handler.
+      if (msec == INFINITE)
+        continue;
+
+      ec = asio::error_code();
+      return 0;
+    }
+
+    for (ULONG i = 0; i < overlapped_num; ++i)
+    {
+      DWORD bytes_transferred = overlapped_entries[i].dwNumberOfBytesTransferred;
+      dword_ptr_t completion_key = overlapped_entries[i].lpCompletionKey;
+      LPOVERLAPPED overlapped = overlapped_entries[i].lpOverlapped;
+      if (overlapped)
+      {
+        win_iocp_operation* op = static_cast<win_iocp_operation*>(overlapped);
+        asio::error_code result_ec(static_cast<int>(RtlNtStatusToDosError(op->Internal)),
+          asio::error::get_system_category());
+
+        // We may have been passed the last_error and bytes_transferred in the OVERLAPPED structure itself.
+        if (completion_key == overlapped_contains_result)
+        {
+          result_ec = asio::error_code(static_cast<int>(op->Internal),
+            *reinterpret_cast<asio::error_category*>(op->Offset));
+          bytes_transferred = op->OffsetHigh;
+        }
+        else
+        {
+          // Otherwise ensure any result has been saved into the OVERLAPPED structure.
+          op->Internal = static_cast<ULONG_PTR>(result_ec.value());
+          op->Offset = reinterpret_cast<DWORD>(&result_ec.category());
+          op->OffsetHigh = bytes_transferred;
+        }
+
+        // Dispatch the operation only if ready. The operation may not be ready
+        // if the initiating function (e.g. a call to WSARecv) has not yet
+        // returned. This is because the initiating function still wants access
+        // to the operation's OVERLAPPED structure.
+        if (::InterlockedCompareExchange(&op->ready_, 1, 0) == 1)
+        {
+          // Ensure the count of outstanding work is decremented on block exit.
+          work_finished_on_block_exit on_exit = { this };
+          (void)on_exit;
+
+          op->complete(this, result_ec, bytes_transferred);
+          this_thread.rethrow_pending_exception();
+          ec = asio::error_code();
+        }
+      }
+      else if (completion_key == wake_for_dispatch)
+      {
+        // We have been woken up to try to acquire responsibility for dispatching
+        // timers and completed operations.
+      }
+      else
+      {
+        // Indicate that there is no longer an in-flight stop event.
+        ::InterlockedExchange(&stop_event_posted_, 0);
+
+        // The stopped_ flag is always checked to ensure that any leftover
+        // stop events from a previous run invocation are ignored.
+        if (::InterlockedExchangeAdd(&stopped_, 0) != 0)
+        {
+          // Wake up next thread that is blocked on GetQueuedCompletionStatus.
+          if (::InterlockedExchange(&stop_event_posted_, 1) == 0)
+          {
+            if (!::PostQueuedCompletionStatus(iocp_.handle, 0, 0, 0))
+            {
+              last_error = ::GetLastError();
+              ec = asio::error_code(last_error,
+                asio::error::get_system_category());
+              return 0;
+            }
+          }
+
+          ec = asio::error_code();
+          return 0;
+        }
+      }
+    }
+
+    return static_cast<size_t>(overlapped_num);
+  }
+#else
   for (;;)
   {
     // Try to acquire responsibility for dispatching timers and completed ops.
@@ -433,22 +560,22 @@ size_t win_iocp_io_context::do_one(DWORD msec,
     LPOVERLAPPED overlapped = 0;
     ::SetLastError(0);
     BOOL ok = ::GetQueuedCompletionStatus(iocp_.handle,
-        &bytes_transferred, &completion_key, &overlapped,
-        msec < gqcs_timeout_ ? msec : gqcs_timeout_);
+      &bytes_transferred, &completion_key, &overlapped,
+      msec < gqcs_timeout_ ? msec : gqcs_timeout_);
     DWORD last_error = ::GetLastError();
 
     if (overlapped)
     {
       win_iocp_operation* op = static_cast<win_iocp_operation*>(overlapped);
       asio::error_code result_ec(last_error,
-          asio::error::get_system_category());
+        asio::error::get_system_category());
 
       // We may have been passed the last_error and bytes_transferred in the
       // OVERLAPPED structure itself.
       if (completion_key == overlapped_contains_result)
       {
-        result_ec = asio::error_code(static_cast<int>(op->Offset),
-            *reinterpret_cast<asio::error_category*>(op->Internal));
+        result_ec = asio::error_code(static_cast<int>(op->Internal),
+          *reinterpret_cast<asio::error_category*>(op->Offset));
         bytes_transferred = op->OffsetHigh;
       }
 
@@ -456,8 +583,8 @@ size_t win_iocp_io_context::do_one(DWORD msec,
       // structure.
       else
       {
-        op->Internal = reinterpret_cast<ulong_ptr_t>(&result_ec.category());
-        op->Offset = result_ec.value();
+        op->Internal = static_cast<ULONG_PTR>(result_ec.value());
+        op->Offset = reinterpret_cast<DWORD>(&result_ec.category());
         op->OffsetHigh = bytes_transferred;
       }
 
@@ -482,7 +609,7 @@ size_t win_iocp_io_context::do_one(DWORD msec,
       if (last_error != WAIT_TIMEOUT)
       {
         ec = asio::error_code(last_error,
-            asio::error::get_system_category());
+          asio::error::get_system_category());
         return 0;
       }
 
@@ -515,7 +642,7 @@ size_t win_iocp_io_context::do_one(DWORD msec,
           {
             last_error = ::GetLastError();
             ec = asio::error_code(last_error,
-                asio::error::get_system_category());
+              asio::error::get_system_category());
             return 0;
           }
         }
@@ -525,6 +652,7 @@ size_t win_iocp_io_context::do_one(DWORD msec,
       }
     }
   }
+#endif    
 }
 
 DWORD win_iocp_io_context::get_gqcs_timeout()

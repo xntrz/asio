@@ -32,6 +32,9 @@
 # endif // defined(__BORLANDC__)
 # include <winsock2.h>
 # include <ws2tcpip.h>
+# if defined(ASIO_HAS_WIN_IOCP_EX)
+#  include <winternl.h>
+# endif // defined(ASIO_HAS_WIN_IOCP_EX)
 # if defined(WINAPI_FAMILY)
 #  if ((WINAPI_FAMILY & WINAPI_PARTITION_DESKTOP) != 0)
 #   include <windows.h>
@@ -49,6 +52,9 @@
 #   pragma comment(lib, "ws2.lib")
 #  elif defined(_MSC_VER) || defined(__BORLANDC__)
 #   pragma comment(lib, "ws2_32.lib")
+#   if defined(ASIO_HAS_WIN_IOCP_EX)
+#    pragma comment(lib, "ntdll.lib")
+#   endif // defined(ASIO_HAS_WIN_IOCP_EX)
 #   if !defined(ASIO_WINDOWS_APP)
 #    pragma comment(lib, "mswsock.lib")
 #   endif // !defined(ASIO_WINDOWS_APP)
