@@ -472,7 +472,7 @@ size_t win_iocp_io_context::do_one(DWORD msec,
       {
         win_iocp_operation* op = static_cast<win_iocp_operation*>(overlapped);
 
-        int errcode = op->Internal;
+        int errcode = static_cast<int>(op->Internal);
         if (completion_key != overlapped_contains_result)
           errcode = static_cast<int>(RtlNtStatusToDosError(op->Internal));
 
