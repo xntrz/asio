@@ -471,7 +471,12 @@ size_t win_iocp_io_context::do_one(DWORD msec,
       if (overlapped)
       {
         win_iocp_operation* op = static_cast<win_iocp_operation*>(overlapped);
-        asio::error_code result_ec(static_cast<int>(RtlNtStatusToDosError(op->Internal)),
+
+        int errcode = op->Internal;
+        if (completion_key != overlapped_contains_result)
+          errcode = static_cast<int>(RtlNtStatusToDosError(op->Internal));
+
+        asio::error_code result_ec(errcode,
           asio::error::get_system_category());
 
         // We may have been passed the last_error and bytes_transferred in the OVERLAPPED structure itself.
